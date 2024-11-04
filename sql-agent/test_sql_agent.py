@@ -45,7 +45,7 @@ if __name__ == "__main__":
     question = "What books are related to Art?"
     # Convert a natural language query to SQL
     result = agent.generate_sql(question)
-    print("SQL query: " + result["sql"])
+    print(f"""INFO: Generated SQL query below \n {result["sql"]}""")
 
     llm = ChatGroq(
         model=llm_model,
@@ -63,12 +63,11 @@ if __name__ == "__main__":
     # Convert a natural language query to SQL
     result = agent.generate_sql(question)
 
-
-    print(result)
     # If successful, execute the query
     if result["success"]:
         df = agent.execute_query(result["sql"])
-        print(df)
-
         result = llm.invoke(f"Convert the following results in CSV format in a natural conversational language tone based on the user question: {question} and results: {df.to_csv()}")
+        print()
+        print("Final response in user friendly language below:")
+        print()
         print(result.content)

@@ -180,8 +180,10 @@ Only return SQL query in the response without any formatting"""
         sql = self.llm.invoke(prompt)
         sql_query = sql.content
 
+        llm_validated_sql_query = self._validate_sql_query_via_agent(sql_query)
+
         # Validate and clean the SQL
-        is_valid, error = self._validate_sql(sql_query)
+        is_valid, error = self._validate_sql(llm_validated_sql_query)
         if not is_valid:
             return {
                 "success": False,
@@ -189,7 +191,7 @@ Only return SQL query in the response without any formatting"""
                 "sql": None
             }
 
-        cleaned_sql = self._clean_sql(sql_query)
+        cleaned_sql = self._clean_sql(llm_validated_sql_query)
 
         return {
             "success": True,
@@ -211,6 +213,28 @@ Only return SQL query in the response without any formatting"""
         # This would typically use an LLM to generate an explanation
         # For now, we'll return a simple placeholder
         return "This query retrieves data from the specified tables with the given conditions."
+
+    def _validate_sql_query_via_agent(self, sql: str, dialect="sqllite"):
+
+        validation_sql_prompt = f"""Double check the user's {dialect} query for common mistakes, including:
+        - Only return SQL Query not anything else like ```sql ... ```
+        - Using NOT IN with NULL values
+        - Using UNION when UNION ALL should have been used
+        - Using BETWEEN for exclusive ranges
+        - Data type mismatch in predicates\
+        - Using the correct number of arguments for functions
+        - Casting to the correct data type
+        - Using the proper columns for joins
+        - Do not apply any LIMIT on results
+        - Include tags column if defined for finding items in every result
+        
+        If there are any of the above mistakes, rewrite the query.
+        If there are no mistakes, just reproduce the original query with no further commentary.
+        
+        Output the final SQL query only for the following SQL query: {sql}"""
+
+        cleaned_sql_query = self.llm.invoke(validation_sql_prompt)
+        return cleaned_sql_query.content
 
     def execute_query(self, sql: str) -> pd.DataFrame:
         """
