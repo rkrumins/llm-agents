@@ -13,7 +13,7 @@ class TableSchema:
 
 
 class SQLAgent:
-    def __init__(self, db_path: str, llm):
+    def __init__(self, db_path: str, llm, sample_data_rows_count: int = 5):
         """
         Initialize the SQL Agent with a database connection.
 
@@ -24,6 +24,7 @@ class SQLAgent:
         self.conn = sqlite3.connect(db_path)
         self.tables = self._load_database_schema()
         self.llm = llm
+        self.sample_rows_count = sample_data_rows_count
 
     def _load_database_schema(self) -> Dict[str, TableSchema]:
         """
@@ -50,8 +51,8 @@ class SQLAgent:
                     "primary_key": bool(col[5])
                 })
 
-            # Get sample data (first 5 rows)
-            sample_data = pd.read_sql(f"SELECT * FROM {table_name} LIMIT 5", self.conn)
+            # Get sample data (first X number of rows)
+            sample_data = pd.read_sql(f"SELECT * FROM {table_name} LIMIT {self.sample_rows_count}", self.conn)
 
             tables[table_name] = TableSchema(
                 name=table_name,
@@ -226,7 +227,6 @@ Only return SQL query in the response without any formatting"""
         - Casting to the correct data type
         - Using the proper columns for joins
         - Do not apply any LIMIT on results
-        - Include tags column if defined for finding items in every result
         
         If there are any of the above mistakes, rewrite the query.
         If there are no mistakes, just reproduce the original query with no further commentary.
