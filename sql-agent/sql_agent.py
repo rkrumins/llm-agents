@@ -136,6 +136,35 @@ class SQLAgent:
         except Exception as e:
             raise ValueError(f"Error analyzing relationships: {str(e)}")
 
+    def _find_join_path(self, start_table: str, end_table: str) -> List[Tuple[str, str, str, str]]:
+        """
+        Find the shortest path to join two tables.
+
+        Returns:
+            List of (table1, column1, table2, column2) representing the join path
+        """
+        if start_table == end_table:
+            return []
+
+        visited = {start_table}
+        queue = [(start_table, [])]
+
+        while queue:
+            current_table, path = queue.pop(0)
+
+            for next_table, relationships in self.tables[current_table].relationships.items():
+                if next_table not in visited:
+                    if next_table == end_table:
+                        # Found the target table
+                        return path + [(current_table, relationships[0][0],
+                                        next_table, relationships[0][1])]
+
+                    visited.add(next_table)
+                    queue.append((next_table, path + [(current_table, relationships[0][0],
+                                                       next_table, relationships[0][1])]))
+
+        return None  # No path found
+
     def _generate_join_conditions(self, required_tables: Set[str]) -> List[str]:
         """
         Generate optimal JOIN conditions for the required tables.
@@ -201,21 +230,6 @@ class SQLAgent:
         Returns:
             String containing the schema description
         """
-        # context = "Database Schema:\n\n"
-        #
-        # for table_name, schema in self.tables.items():
-        #     context += f"Table: {table_name}\n"
-        #     context += "Columns:\n"
-        #
-        #     for col in schema.columns:
-        #         nullable = "NULL" if col["nullable"] else "NOT NULL"
-        #         pk = " (PRIMARY KEY)" if col["primary_key"] else ""
-        #         context += f"- {col['name']}: {col['type']} {nullable}{pk}\n"
-        #
-        #     context += "\nSample data:\n"
-        #     context += schema.sample_data.to_string() + "\n\n"
-        #
-        # return context
 
         # Extract required tables
         required_tables = self._extract_required_tables(query)
@@ -257,7 +271,7 @@ class SQLAgent:
         prompt = f"""
 You are a {dialect} expert.
 
-Please help to generate a {dialect} query to answer the question. Your response should ONLY be based on the given context and follow the rules.
+Please help to generate a {dialect} query to answer the question. Your response should ONLY be based on the given context and must follow the rules.
 
 Given the relevant database schema and sample data:
 
@@ -277,8 +291,12 @@ Rules:
 9. Please use the most relevant table(s).
 10. Please format the query before responding.
 11. Please always respond with a valid well-formed JSON object with the following format
+12. You MUST evaluate thoroughly the question against the relevant database schema and be creative about answering it for what selection of fields to query
+13. If question contains a geographical region, broad category or anything generic, you MUST review the relevant database schema and adapt the result for that 
+14. If relevant, you can include multiple filter conditions if they are applicable to the question
 
 Only return SQL query in the response without any formatting. You MUST NOT skip over Rules.
+
 
 SQL Query:"""
 
@@ -345,7 +363,7 @@ SQL Query:"""
 
         try:
             required_tables = self._extract_required_tables(query)
-            print(required_tables)
+            # print(required_tables)
             prompt = self._generate_prompt(query)
             print("DEBUG: Prompt set to: {}".format(prompt))
 
@@ -353,7 +371,8 @@ SQL Query:"""
             sql_query = sql.content
             print("DEBUG: SQL query set to: {}".format(sql_query))
 
-            llm_validated_sql_query = self._validate_sql_query_via_agent(sql_query)
+            llm_validated_sql_query = sql_query
+            # llm_validated_sql_query = self._validate_sql_query_via_agent(sql_query)
 
             # Validate and extract metadata
             metadata = QueryMetadata(
@@ -363,6 +382,8 @@ SQL Query:"""
                 where_conditions=sql_table_analyzer_utils.extract_where_conditions(llm_validated_sql_query),
                 execution_time=(datetime.now() - start_time).total_seconds()
             )
+
+            print("Metadata: \n" + str(metadata.model_dump()))
 
             return SQLQueryResult(
                 success=True,
