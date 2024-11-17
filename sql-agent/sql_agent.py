@@ -24,7 +24,7 @@ class SQLAgent:
         self.conn = sqlite3.connect(db_path)
         self.tables = self._load_database_schema()
         self.llm = llm
-        self.sample_rows_count = sample_data_rows_count
+        self.sample_data_rows_count = sample_data_rows_count
 
     def _load_database_schema(self) -> Dict[str, TableSchema]:
         """
@@ -52,7 +52,8 @@ class SQLAgent:
                 })
 
             # Get sample data (first X number of rows)
-            sample_data = pd.read_sql(f"SELECT * FROM {table_name} LIMIT {self.sample_rows_count}", self.conn)
+            sample_rows_count = 5
+            sample_data = pd.read_sql(f"SELECT * FROM {table_name} LIMIT {sample_rows_count}", self.conn)
 
             tables[table_name] = TableSchema(
                 name=table_name,
