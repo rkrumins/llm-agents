@@ -35,6 +35,8 @@ if __name__ == "__main__":
 
     csv_file_path = str(here("example")) + "/books_data.csv"
     db_file_path = str(here("example")) + "/sqldb.db"
+    if os.path.isfile(db_file_path):
+        os.remove(db_file_path)
     db_path = f"sqlite:///{db_file_path}"
 
     load_sample_csv_data_to_db(csv_file_path=csv_file_path, db_path=db_path, table_name="books")

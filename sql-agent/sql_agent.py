@@ -1,15 +1,12 @@
 import sqlite3
-from typing import List, Dict, Tuple, Optional
+from collections import defaultdict
+from datetime import datetime
+from itertools import combinations
+from typing import List, Dict, Tuple, Optional, Set
 import pandas as pd
-from dataclasses import dataclass
 import re
-
-
-@dataclass
-class TableSchema:
-    name: str
-    columns: List[Dict[str, str]]
-    sample_data: pd.DataFrame
+import sql_table_analyzer_utils
+from models import ColumnInfo, TableSchema, QueryMetadata, SQLQueryResult
 
 
 class SQLAgent:
@@ -24,7 +21,7 @@ class SQLAgent:
         self.conn = sqlite3.connect(db_path)
         self.tables = self._load_database_schema()
         self.llm = llm
-        self.sample_rows_count = sample_data_rows_count
+        self.sample_data_rows_count = sample_data_rows_count
 
     def _load_database_schema(self) -> Dict[str, TableSchema]:
         """
@@ -39,53 +36,213 @@ class SQLAgent:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
         tables = {}
 
-        for (table_name,) in cursor.fetchall():
-            # Get column information
-            cursor.execute(f"PRAGMA table_info({table_name});")
-            columns = []
-            for col in cursor.fetchall():
-                columns.append({
-                    "name": col[1],
-                    "type": col[2],
-                    "nullable": not col[3],
-                    "primary_key": bool(col[5])
-                })
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
 
-            # Get sample data (first X number of rows)
-            sample_data = pd.read_sql(f"SELECT * FROM {table_name} LIMIT {self.sample_rows_count}", self.conn)
+            for (table_name,) in cursor.fetchall():
+                # Get column information
+                cursor.execute(f"PRAGMA table_info({table_name});")
+                columns = {}
 
-            tables[table_name] = TableSchema(
-                name=table_name,
-                columns=columns,
-                sample_data=sample_data
-            )
+                for col in cursor.fetchall():
+                    columns[col[1]] = ColumnInfo(
+                        name=col[1],
+                        type=col[2],
+                        nullable=not col[3],
+                        primary_key=bool(col[5])
+                    )
 
-        return tables
+                # Get foreign key information
+                cursor.execute(f"PRAGMA foreign_key_list({table_name});")
+                for fk in cursor.fetchall():
+                    if fk[3] in columns:
+                        columns[fk[3]].foreign_key = (fk[2], fk[4])
 
-    def _generate_schema_context(self) -> str:
+                # Get strategic sample
+                row_count = self._get_row_count(table_name)
+
+                if row_count <= 5:
+                    sample_query = f"SELECT * FROM {table_name}"
+                else:
+                    sample_query = f"""
+                            SELECT * FROM {table_name} 
+                            WHERE ROWID IN (
+                                SELECT ROWID FROM {table_name} 
+                                WHERE ROWID IN (
+                                    SELECT ABS(RANDOM() % {row_count}) + 1
+                                    FROM (SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4 UNION SELECT 5)
+                                )
+                            )
+                            LIMIT 5
+                            """
+
+                sample_data = pd.read_sql(sample_query, self.conn)
+
+                # Analyze column values
+                for col_name in columns:
+                    if col_name in sample_data.columns:
+                        values, unique_ratio, null_ratio = sql_table_analyzer_utils.analyze_column_values(
+                            sample_data, col_name
+                        )
+                        columns[col_name].sample_values = values
+                        columns[col_name].unique_ratio = unique_ratio
+                        columns[col_name].null_ratio = null_ratio
+
+                tables[table_name] = TableSchema(
+                    name=table_name,
+                    columns=columns,
+                    sample_data=sample_data,
+                    row_count=row_count,
+                    relationships={}
+                )
+
+            return tables
+
+        except Exception as e:
+            raise ValueError(f"Error loading database schema: {str(e)}")
+
+
+    def _analyze_relationships(self) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
+        """
+        Analyze and store relationships between tables.
+
+        Returns:
+            Dictionary mapping table pairs to their relationships
+        """
+        relationships = defaultdict(lambda: defaultdict(list))
+
+        try:
+            # Add explicit relationships from foreign keys
+            for table_name, table_schema in self.tables.items():
+                for col_name, col_info in table_schema.columns.items():
+                    if col_info.foreign_key:
+                        referenced_table, referenced_col = col_info.foreign_key
+                        relationships[table_name][referenced_table].append((col_name, referenced_col))
+                        self.tables[table_name].relationships[referenced_table] = [(col_name, referenced_col)]
+
+            # Detect implicit relationships
+            for table1_name, table2_name in combinations(self.tables.keys(), 2):
+                if table2_name not in relationships[table1_name]:
+                    detected_relationships = sql_table_analyzer_utils.detect_relationships(
+                        self.tables[table1_name].sample_data,
+                        self.tables[table2_name].sample_data
+                    )
+                    if detected_relationships:
+                        relationships[table1_name][table2_name].extend(detected_relationships)
+                        self.tables[table1_name].relationships[table2_name] = detected_relationships
+
+            return relationships
+
+        except Exception as e:
+            raise ValueError(f"Error analyzing relationships: {str(e)}")
+
+    def _generate_join_conditions(self, required_tables: Set[str]) -> List[str]:
+        """
+        Generate optimal JOIN conditions for the required tables.
+
+        Args:
+            required_tables: Set of tables that need to be joined
+
+        Returns:
+            List of JOIN clauses
+        """
+        if len(required_tables) <= 1:
+            return []
+
+        # Find the optimal join order based on table sizes and relationships
+        tables_list = list(required_tables)
+        join_conditions = []
+
+        # Start with the largest table as the base
+        base_table = max(tables_list, key=lambda t: self.tables[t].row_count)
+        remaining_tables = set(tables_list) - {base_table}
+
+        while remaining_tables:
+            best_next_table = None
+            best_join_path = None
+
+            for table in remaining_tables:
+                join_path = self._find_join_path(base_table, table)
+                if join_path is not None:
+                    if best_next_table is None or len(join_path) < len(best_join_path):
+                        best_next_table = table
+                        best_join_path = join_path
+
+            if best_next_table is None:
+                # No direct join path found, try to find an intermediate table
+                for intermediate in self.tables.keys():
+                    if intermediate not in remaining_tables and intermediate != base_table:
+                        path1 = self._find_join_path(base_table, intermediate)
+                        if path1:
+                            for table in remaining_tables:
+                                path2 = self._find_join_path(intermediate, table)
+                                if path2:
+                                    best_next_table = table
+                                    best_join_path = path1 + path2
+                                    break
+                            if best_next_table:
+                                break
+
+            if best_next_table and best_join_path:
+                for t1, c1, t2, c2 in best_join_path:
+                    join_conditions.append(f"LEFT JOIN {t2} ON {t1}.{c1} = {t2}.{c2}")
+                remaining_tables.remove(best_next_table)
+            else:
+                # If no join path found, use CROSS JOIN as last resort
+                next_table = remaining_tables.pop()
+                join_conditions.append(f"CROSS JOIN {next_table}")
+
+        return join_conditions
+
+    def _generate_schema_context(self, query: str) -> str:
         """
         Generate a natural language description of the database schema.
 
         Returns:
             String containing the schema description
         """
-        context = "Database Schema:\n\n"
+        # context = "Database Schema:\n\n"
+        #
+        # for table_name, schema in self.tables.items():
+        #     context += f"Table: {table_name}\n"
+        #     context += "Columns:\n"
+        #
+        #     for col in schema.columns:
+        #         nullable = "NULL" if col["nullable"] else "NOT NULL"
+        #         pk = " (PRIMARY KEY)" if col["primary_key"] else ""
+        #         context += f"- {col['name']}: {col['type']} {nullable}{pk}\n"
+        #
+        #     context += "\nSample data:\n"
+        #     context += schema.sample_data.to_string() + "\n\n"
+        #
+        # return context
 
-        for table_name, schema in self.tables.items():
-            context += f"Table: {table_name}\n"
-            context += "Columns:\n"
+        # Extract required tables
+        required_tables = self._extract_required_tables(query)
 
-            for col in schema.columns:
-                nullable = "NULL" if col["nullable"] else "NOT NULL"
-                pk = " (PRIMARY KEY)" if col["primary_key"] else ""
-                context += f"- {col['name']}: {col['type']} {nullable}{pk}\n"
+        # Generate focused schema context only for relevant tables
+        schema_context = "Relevant Tables for your query:\n\n"
 
-            context += "\nSample data:\n"
-            context += schema.sample_data.to_string() + "\n\n"
+        for table_name in required_tables:
+            schema = self.tables[table_name]
+            schema_context += f"Table: {table_name} ({schema.row_count} total rows)\n"
+            schema_context += "Columns:\n"
 
-        return context
+            for col_name, col_info in schema.columns.items():
+                schema_context += f"- {col_name}: {col_info.type}"
+                if col_info.sample_values:
+                    schema_context += f" (Sample values: {', '.join(map(str, col_info.sample_values))})"
+                schema_context += "\n"
 
-    def _generate_prompt(self, query: str) -> str:
+        # Add join information
+        join_conditions = self._generate_join_conditions(required_tables)
+        if join_conditions:
+            schema_context += "\nSuggested Joins:\n"
+            schema_context += "\n".join(join_conditions) + "\n"
+
+        return schema_context
+
+    def _generate_prompt(self, query: str, dialect: str = "SQLite") -> str:
         """
         Generate a prompt for the LLM including schema context and query.
 
@@ -95,25 +252,35 @@ class SQLAgent:
         Returns:
             Complete prompt string
         """
-        schema_context = self._generate_schema_context()
+        schema_context = self._generate_schema_context(query)
 
-        prompt = f"""Given the following database schema and sample data:
+        prompt = f"""
+You are a {dialect} expert.
+
+Please help to generate a {dialect} query to answer the question. Your response should ONLY be based on the given context and follow the rules.
+
+Given the relevant database schema and sample data:
 
 {schema_context}
 
 Convert this question to SQL: "{query}"
 
 Rules:
-1. Use only tables and columns that exist in the schema
-2. Return a valid SQL query that will answer the question
-3. Use proper SQL syntax and formatting
-4. Consider the sample data when writing the query
-5. Use appropriate JOIN conditions based on the schema
-6. Add comments to explain complex parts of the query
+1. Use only the tables and columns shown above
+2. Use the suggested joins when combining tables
+3. Consider the sample values when writing conditions
+4. Use appropriate aggregations based on the question
+5. Add comments to explain complex parts
+6. Consider table sizes when ordering joins
+7. If the provided context is sufficient, please generate a valid query without any explanations for the question. The query should start with a comment containing the question being asked.
+8. If the provided context is insufficient, please explain why it can't be generated.
+9. Please use the most relevant table(s).
+10. Please format the query before responding.
+11. Please always respond with a valid well-formed JSON object with the following format
 
-SQL Query:
+Only return SQL query in the response without any formatting. You MUST NOT skip over Rules.
 
-Only return SQL query in the response without any formatting"""
+SQL Query:"""
 
         return prompt
 
@@ -164,7 +331,7 @@ Only return SQL query in the response without any formatting"""
 
         return "\n".join(formatted_lines).strip()
 
-    def generate_sql(self, query: str) -> Dict[str, str]:
+    def generate_sql(self, query: str) -> SQLQueryResult:
         """
         Convert a natural language query to SQL.
 
@@ -174,32 +341,43 @@ Only return SQL query in the response without any formatting"""
         Returns:
             Dictionary containing the generated SQL and any relevant metadata
         """
-        # Here you would typically call your LLM with the prompt
-        # For this example, we'll use a placeholder that demonstrates the structure
-        prompt = self._generate_prompt(query)
+        start_time = datetime.now()
 
-        sql = self.llm.invoke(prompt)
-        sql_query = sql.content
+        try:
+            required_tables = self._extract_required_tables(query)
+            print(required_tables)
+            prompt = self._generate_prompt(query)
+            print("DEBUG: Prompt set to: {}".format(prompt))
 
-        llm_validated_sql_query = self._validate_sql_query_via_agent(sql_query)
+            sql = self.llm.invoke(prompt)
+            sql_query = sql.content
+            print("DEBUG: SQL query set to: {}".format(sql_query))
 
-        # Validate and clean the SQL
-        is_valid, error = self._validate_sql(llm_validated_sql_query)
-        if not is_valid:
-            return {
-                "success": False,
-                "error": error,
-                "sql": None
-            }
+            llm_validated_sql_query = self._validate_sql_query_via_agent(sql_query)
 
-        cleaned_sql = self._clean_sql(llm_validated_sql_query)
+            # Validate and extract metadata
+            metadata = QueryMetadata(
+                tables_used=list(required_tables),
+                columns_used=sql_table_analyzer_utils.extract_columns_used(llm_validated_sql_query),
+                joins_used=sql_table_analyzer_utils.extract_joins(llm_validated_sql_query),
+                where_conditions=sql_table_analyzer_utils.extract_where_conditions(llm_validated_sql_query),
+                execution_time=(datetime.now() - start_time).total_seconds()
+            )
 
-        return {
-            "success": True,
-            "sql": cleaned_sql,
-            "tables_used": self._extract_tables_used(cleaned_sql),
-            "explanation": self._generate_query_explanation(cleaned_sql)
-        }
+            return SQLQueryResult(
+                success=True,
+                sql=llm_validated_sql_query,
+                metadata=metadata,
+                explanation=self._generate_query_explanation(llm_validated_sql_query)
+            )
+
+        except Exception as e:
+            print(e)
+            return SQLQueryResult(
+                success=False,
+                error=str(e),
+                execution_time=(datetime.now() - start_time).total_seconds()
+            )
 
     def _extract_tables_used(self, sql: str) -> List[str]:
         """Extract table names used in the SQL query."""
@@ -208,6 +386,35 @@ Only return SQL query in the response without any formatting"""
             if re.search(r'\b' + table + r'\b', sql):
                 tables.append(table)
         return tables
+
+    def _extract_required_tables(self, query: str) -> Set[str]:
+        """
+        Extract tables that might be needed for the query based on context.
+
+        Args:
+            query: Natural language query
+
+        Returns:
+            Set of table names
+        """
+        required_tables = set()
+
+        # Convert query to lowercase for case-insensitive matching
+        query_lower = query.lower()
+
+        # Look for table names in the query
+        for table_name in self.tables.keys():
+            # Check for both plural and singular forms
+            if table_name.lower() in query_lower or f"{table_name}s".lower() in query_lower:
+                required_tables.add(table_name)
+
+        # Look for column names in the query
+        for table_name, schema in self.tables.items():
+            for col_name in schema.columns.keys():
+                if col_name.lower() in query_lower:
+                    required_tables.add(table_name)
+
+        return required_tables
 
     def _generate_query_explanation(self, sql: str) -> str:
         """Generate a natural language explanation of the SQL query."""
@@ -250,6 +457,15 @@ Only return SQL query in the response without any formatting"""
             return pd.read_sql(sql, self.conn)
         except sqlite3.Error as e:
             raise Exception(f"Error executing query: {str(e)}")
+
+    def _get_row_count(self, table_name: str) -> int:
+        """Get the total number of rows in a table."""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            return cursor.fetchone()[0]
+        except Exception as e:
+            raise ValueError(f"Error getting row count for table {table_name}: {str(e)}")
 
     def __del__(self):
         """Cleanup database connection."""
