@@ -136,6 +136,35 @@ class SQLAgent:
         except Exception as e:
             raise ValueError(f"Error analyzing relationships: {str(e)}")
 
+    def _find_join_path(self, start_table: str, end_table: str) -> List[Tuple[str, str, str, str]]:
+        """
+        Find the shortest path to join two tables.
+
+        Returns:
+            List of (table1, column1, table2, column2) representing the join path
+        """
+        if start_table == end_table:
+            return []
+
+        visited = {start_table}
+        queue = [(start_table, [])]
+
+        while queue:
+            current_table, path = queue.pop(0)
+
+            for next_table, relationships in self.tables[current_table].relationships.items():
+                if next_table not in visited:
+                    if next_table == end_table:
+                        # Found the target table
+                        return path + [(current_table, relationships[0][0],
+                                        next_table, relationships[0][1])]
+
+                    visited.add(next_table)
+                    queue.append((next_table, path + [(current_table, relationships[0][0],
+                                                       next_table, relationships[0][1])]))
+
+        return None  # No path found
+
     def _generate_join_conditions(self, required_tables: Set[str]) -> List[str]:
         """
         Generate optimal JOIN conditions for the required tables.
@@ -201,21 +230,6 @@ class SQLAgent:
         Returns:
             String containing the schema description
         """
-        # context = "Database Schema:\n\n"
-        #
-        # for table_name, schema in self.tables.items():
-        #     context += f"Table: {table_name}\n"
-        #     context += "Columns:\n"
-        #
-        #     for col in schema.columns:
-        #         nullable = "NULL" if col["nullable"] else "NOT NULL"
-        #         pk = " (PRIMARY KEY)" if col["primary_key"] else ""
-        #         context += f"- {col['name']}: {col['type']} {nullable}{pk}\n"
-        #
-        #     context += "\nSample data:\n"
-        #     context += schema.sample_data.to_string() + "\n\n"
-        #
-        # return context
 
         # Extract required tables
         required_tables = self._extract_required_tables(query)
