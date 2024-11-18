@@ -12,7 +12,7 @@ from models import ColumnInfo, TableSchema, QueryMetadata, SQLQueryResult, Colum
 
 
 class SQLAgent:
-    def __init__(self, db_path: str, llm, sample_data_rows_count: int = 5):
+    def __init__(self, db_path: str, llm):
         """
         Initialize the SQL Agent with a database connection.
 
@@ -23,7 +23,6 @@ class SQLAgent:
         self.conn = sqlite3.connect(db_path)
         self.tables = self._load_database_schema()
         self.llm = llm
-        self.sample_data_rows_count = sample_data_rows_count
 
     def _analyze_column(self, df: pd.DataFrame, column_name: str, sql_type: str, sample_values_count: int = 5) -> ColumnInfo:
         """Analyze a single column for patterns and characteristics"""
@@ -168,7 +167,6 @@ class SQLAgent:
 
         except Exception as e:
             raise ValueError(f"Error loading database schema: {str(e)}")
-
 
     def _analyze_relationships(self) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
         """
