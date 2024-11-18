@@ -7,12 +7,15 @@ from typing import List, Dict, Tuple, Optional, Set
 import numpy as np
 import pandas as pd
 import re
+
+from langchain_core.language_models import BaseChatModel
+
 import sql_table_analyzer_utils
 from models import ColumnInfo, TableSchema, QueryMetadata, SQLQueryResult, ColumnType, ColumnSemantics, ColumnStats
 
 
 class SQLAgent:
-    def __init__(self, db_path: str, llm):
+    def __init__(self, db_path: str, llm: BaseChatModel, sample_data_rows: int = 100):
         """
         Initialize the SQL Agent with a database connection.
 
@@ -21,10 +24,11 @@ class SQLAgent:
         """
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
+        self.sample_data_rows = sample_data_rows
         self.tables = self._load_database_schema()
         self.llm = llm
 
-    def _analyze_column(self, df: pd.DataFrame, column_name: str, sql_type: str, sample_values_count: int = 5) -> ColumnInfo:
+    def _analyze_column(self, df: pd.DataFrame, column_name: str, sql_type: str) -> ColumnInfo:
         """Analyze a single column for patterns and characteristics"""
         series = df[column_name]
 
@@ -34,7 +38,7 @@ class SQLAgent:
             null_count=series.isnull().sum(),
             unique_ratio=series.nunique() / len(df) if len(df) > 0 else 0,
             null_ratio=series.isnull().sum() / len(df) if len(df) > 0 else 0,
-            sample_values=series.head(sample_values_count).tolist()
+            sample_values=series.head(self.sample_data_rows).tolist()
         )
 
         # Calculate numeric stats if applicable
@@ -79,7 +83,7 @@ class SQLAgent:
             semantics=semantics
         )
 
-    def _load_database_schema(self, no_of_sample_data_rows=1000) -> Dict[str, TableSchema]:
+    def _load_database_schema(self) -> Dict[str, TableSchema]:
         """
         Load the schema and sample data for all tables in the database.
 
@@ -128,7 +132,7 @@ class SQLAgent:
                 # Get strategic sample
                 row_count = self._get_row_count(table_name)
 
-                if row_count <= no_of_sample_data_rows:
+                if row_count <= self.sample_data_rows:
                     sample_query = f"SELECT * FROM {table_name}"
                 else:
                     sample_query = f"""
