@@ -3,14 +3,19 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import combinations
 from typing import List, Dict, Tuple, Optional, Set
+
+import numpy as np
 import pandas as pd
 import re
+
+from langchain_core.language_models import BaseChatModel
+
 import sql_table_analyzer_utils
-from models import ColumnInfo, TableSchema, QueryMetadata, SQLQueryResult
+from models import ColumnInfo, TableSchema, QueryMetadata, SQLQueryResult, ColumnType, ColumnSemantics, ColumnStats
 
 
 class SQLAgent:
-    def __init__(self, db_path: str, llm, sample_data_rows_count: int = 5):
+    def __init__(self, db_path: str, llm: BaseChatModel, sample_data_rows: int = 100):
         """
         Initialize the SQL Agent with a database connection.
 
@@ -19,9 +24,64 @@ class SQLAgent:
         """
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
+        self.sample_data_rows = sample_data_rows
         self.tables = self._load_database_schema()
         self.llm = llm
-        self.sample_data_rows_count = sample_data_rows_count
+
+    def _analyze_column(self, df: pd.DataFrame, column_name: str, sql_type: str) -> ColumnInfo:
+        """Analyze a single column for patterns and characteristics"""
+        series = df[column_name]
+
+        # Calculate basic stats
+        stats = ColumnStats(
+            distinct_count=series.nunique(),
+            null_count=series.isnull().sum(),
+            unique_ratio=series.nunique() / len(df) if len(df) > 0 else 0,
+            null_ratio=series.isnull().sum() / len(df) if len(df) > 0 else 0,
+            sample_values=series.head(self.sample_data_rows).tolist()
+        )
+
+        # Calculate numeric stats if applicable
+        if np.issubdtype(series.dtype, np.number):
+            non_null = series.dropna()
+            if len(non_null) > 0:
+                stats.min_value = float(non_null.min())
+                stats.max_value = float(non_null.max())
+                stats.avg_value = float(non_null.mean())
+
+        # Get most common values
+        value_counts = series.value_counts().head(5)
+        stats.common_values = [(val, count) for val, count in value_counts.items()]
+
+        # Determine column type
+        if column_name.lower().endswith('_id'):
+            col_type = ColumnType.ID
+        elif pd.api.types.is_numeric_dtype(series):
+            col_type = ColumnType.NUMERIC
+        elif pd.api.types.is_datetime64_any_dtype(series):
+            col_type = ColumnType.DATE
+        elif pd.api.types.is_bool_dtype(series):
+            col_type = ColumnType.BOOLEAN
+        else:
+            col_type = ColumnType.TEXT
+
+        # Create semantics
+        semantics = ColumnSemantics(
+            is_identifier=col_type == ColumnType.ID,
+            is_metric=pd.api.types.is_numeric_dtype(series),
+            is_categorical=stats.unique_ratio < 0.1,
+            is_temporal=pd.api.types.is_datetime64_any_dtype(series),
+            is_descriptive=column_name.lower() in ['name', 'description', 'title']
+        )
+
+        return ColumnInfo(
+            name=column_name,
+            type=col_type,
+            nullable=stats.null_count > 0,
+            primary_key=stats.unique_ratio == 1.0 and stats.null_count == 0,
+            stats=stats,
+            semantics=semantics
+        )
 
     def _load_database_schema(self) -> Dict[str, TableSchema]:
         """
@@ -40,17 +100,28 @@ class SQLAgent:
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
 
             for (table_name,) in cursor.fetchall():
+                # Get sample data
+                # df = pd.read_sql(f"SELECT * FROM {table_name} LIMIT {no_of_sample_data_rows}", self.conn)
+
                 # Get column information
                 cursor.execute(f"PRAGMA table_info({table_name});")
                 columns = {}
 
                 for col in cursor.fetchall():
-                    columns[col[1]] = ColumnInfo(
-                        name=col[1],
-                        type=col[2],
+                    column_name = col[1]
+                    column_type = col[2]
+                    columns[column_name] = ColumnInfo(
+                        name=column_name,
+                        type=column_type,
                         nullable=not col[3],
                         primary_key=bool(col[5])
                     )
+
+                # for col in cursor.fetchall():
+                #     coumn_name = col[1]
+                #     column_data_type = col[2]
+                #     col_info = self._analyze_column(df, coumn_name, column_data_type)
+                #     columns[coumn_name] = col_info
 
                 # Get foreign key information
                 cursor.execute(f"PRAGMA foreign_key_list({table_name});")
@@ -61,7 +132,7 @@ class SQLAgent:
                 # Get strategic sample
                 row_count = self._get_row_count(table_name)
 
-                if row_count <= 5:
+                if row_count <= self.sample_data_rows:
                     sample_query = f"SELECT * FROM {table_name}"
                 else:
                     sample_query = f"""
@@ -100,7 +171,6 @@ class SQLAgent:
 
         except Exception as e:
             raise ValueError(f"Error loading database schema: {str(e)}")
-
 
     def _analyze_relationships(self) -> Dict[str, Dict[str, List[Tuple[str, str]]]]:
         """

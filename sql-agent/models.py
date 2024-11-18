@@ -1,6 +1,48 @@
+from enum import Enum
 from typing import Optional, Tuple, Any, List, Dict
 from pydantic import BaseModel, Field, field_validator
 
+
+class ColumnType(str, Enum):
+    """Standardized column types for better analysis"""
+    NUMERIC = "numeric"
+    TEXT = "text"
+    DATE = "date"
+    BOOLEAN = "boolean"
+    ID = "id"
+    FOREIGN_KEY = "foreign_key"
+    UNKNOWN = "unknown"
+
+
+class ColumnSemantics(BaseModel):
+    """Semantic information about a column"""
+    is_identifier: bool = False
+    is_metric: bool = False
+    is_categorical: bool = False
+    is_temporal: bool = False
+    is_descriptive: bool = False
+    common_patterns: List[str] = Field(default_factory=list)
+    value_range: Optional[Tuple[Any, Any]] = None
+    related_concepts: List[str] = Field(default_factory=list)
+
+
+class ColumnStats(BaseModel):
+    """Statistical information about a column"""
+    distinct_count: int
+    null_count: int
+    unique_ratio: float
+    null_ratio: float
+    sample_values: List[Any]
+    min_value: Optional[Any] = None
+    max_value: Optional[Any] = None
+    avg_value: Optional[float] = None
+    common_values: List[Tuple[Any, int]] = Field(default_factory=list)
+
+    @field_validator('unique_ratio', 'null_ratio')
+    def validate_ratio(cls, v):
+        if not 0 <= v <= 1:
+            raise ValueError('Ratio must be between 0 and 1')
+        return v
 
 class ColumnInfo(BaseModel):
     name: str
@@ -11,6 +53,8 @@ class ColumnInfo(BaseModel):
     sample_values: Optional[List[Any]] = None
     unique_ratio: Optional[float] = Field(default=None, ge=0, le=1)
     null_ratio: Optional[float] = Field(default=None, ge=0, le=1)
+    stats: Optional[ColumnStats] = None
+    semantics: Optional[ColumnSemantics] = None
 
     @field_validator('unique_ratio', 'null_ratio')
     def validate_ratio(cls, v):
